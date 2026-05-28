@@ -1,0 +1,559 @@
+import { useEffect, useMemo, useState } from "react";
+import axios from "axios";
+import { MapContainer, Marker, Polyline, Popup, TileLayer } from "react-leaflet";
+import "leaflet/dist/leaflet.css";
+import L from "leaflet";
+import "./App.css";
+
+const API_BASE = "http://127.0.0.1:8000";
+const routeColors = ["#16a34a", "#2563eb", "#f59e0b"];
+const routeLetters = ["A", "B", "C"];
+
+delete L.Icon.Default.prototype._getIconUrl;
+L.Icon.Default.mergeOptions({
+  iconRetinaUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png",
+  iconUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png",
+  shadowUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png",
+});
+
+function App() {
+  const [nodes, setNodes] = useState([]);
+  const [edges, setEdges] = useState([]);
+  const [routes, setRoutes] = useState([]);
+  const [compareData, setCompareData] = useState(null);
+  const [source, setSource] = useState("");
+  const [destination, setDestination] = useState("");
+  const [mode, setMode] = useState("normal");
+  const [preference, setPreference] = useState("balanced");
+  const [blockSource, setBlockSource] = useState("");
+  const [blockTarget, setBlockTarget] = useState("");
+  const [rippleSource, setRippleSource] = useState("");
+  const [rippleIntensity, setRippleIntensity] = useState(5);
+  const [status, setStatus] = useState("Loading graph...");
+  const [loading, setLoading] = useState(false);
+  const [mapStyle, setMapStyle] = useState("standard");
+  const [weather, setWeather] = useState({
+    condition: "Clear",
+    temperatureC: 29,
+    visibilityKm: 9,
+    report: "Clear sky with moderate visibility.",
+    impact: 1.05,
+  });
+
+  const nodeById = useMemo(() => {
+    const lookup = {};
+    for (const node of nodes) {
+      lookup[node.id] = node;
+    }
+    return lookup;
+  }, [nodes]);
+
+  const mapCenter = useMemo(() => {
+    if (nodes.length === 0) return [28.6328, 77.2197];
+    const avgLat = nodes.reduce((sum, node) => sum + node.lat, 0) / nodes.length;
+    const avgLng = nodes.reduce((sum, node) => sum + node.lng, 0) / nodes.length;
+    return [avgLat, avgLng];
+  }, [nodes]);
+
+  const analyticsByRoute = useMemo(() => {
+    return routes.map((route) => {
+      const distance = Number(route.distance || 0);
+      const travelTime = Number(route.estimated_time || 0);
+      const averageSpeed = travelTime > 0 ? (distance / (travelTime / 60)) : 0;
+      const trafficDensity = Math.min(10, (Number(route.traffic_cost || 0) / 8));
+      const roadQualityIndex = Math.max(1, Math.min(10, 11 - trafficDensity * 0.8));
+      const weatherImpact = Number((weather.impact * (1 + trafficDensity / 30)).toFixed(2));
+      const accidentRiskScore = Math.max(
+        1,
+        Math.min(100, Math.round(trafficDensity * 6 + (10 - roadQualityIndex) * 5 + weatherImpact * 8)),
+      );
+      const safetyScore = Math.max(1, 100 - accidentRiskScore);
+      const confidence = Math.max(55, Math.min(98, Math.round(92 - weatherImpact * 8 - trafficDensity * 2)));
+      const ecoScore = Math.max(1, Math.min(100, Math.round(100 - distance * 6 - trafficDensity * 3)));
+      const roadCondition =
+        roadQualityIndex >= 8 ? "Excellent" : roadQualityIndex >= 6 ? "Good" : roadQualityIndex >= 4 ? "Moderate" : "Rough";
+      const congestionBand =
+        trafficDensity >= 8 ? "Severe" : trafficDensity >= 6 ? "Heavy" : trafficDensity >= 4 ? "Moderate" : "Light";
+      const delayIndex = Number((weatherImpact * trafficDensity * 1.4).toFixed(1));
+
+      return {
+        distance: Number(distance.toFixed(2)),
+        averageSpeed: Number(averageSpeed.toFixed(1)),
+        trafficDensity: Number(trafficDensity.toFixed(1)),
+        roadQualityIndex: Number(roadQualityIndex.toFixed(1)),
+        weatherImpact,
+        accidentRiskScore,
+        travelTime: Number(travelTime.toFixed(2)),
+        weatherReport: weather.report,
+        safetyScore,
+        confidence,
+        ecoScore,
+        roadCondition,
+        congestionBand,
+        delayIndex,
+      };
+    });
+  }, [routes, weather]);
+
+  const routeComparison = useMemo(() => {
+    if (routes.length < 2) return null;
+    let shortIdx = 0;
+    let safeIdx = 0;
+
+    for (let i = 1; i < routes.length; i += 1) {
+      if (routes[i].distance < routes[shortIdx].distance) shortIdx = i;
+      if (analyticsByRoute[i].accidentRiskScore < analyticsByRoute[safeIdx].accidentRiskScore) safeIdx = i;
+    }
+
+    return {
+      shortIdx,
+      safeIdx,
+      shortRoute: routes[shortIdx],
+      safeRoute: routes[safeIdx],
+      shortAnalytics: analyticsByRoute[shortIdx],
+      safeAnalytics: analyticsByRoute[safeIdx],
+    };
+  }, [routes, analyticsByRoute]);
+
+  const smartInsights = useMemo(() => {
+    if (routes.length === 0 || analyticsByRoute.length === 0) return [];
+    const best = analyticsByRoute[0];
+    const insights = [];
+    if (best.accidentRiskScore > 60) {
+      insights.push("High risk detected. Prefer safer route mode during peak traffic.");
+    }
+    if (best.weatherImpact > 1.25) {
+      insights.push("Weather impact is significant. Keep extra braking distance.");
+    }
+    if (best.averageSpeed < 20) {
+      insights.push("Average speed is low. Consider emergency mode for urgent trips.");
+    }
+    if (insights.length === 0) {
+      insights.push("Conditions look stable. Current top route is balanced and efficient.");
+    }
+    return insights;
+  }, [routes, analyticsByRoute]);
+
+  const networkHealth = useMemo(() => {
+    if (!analyticsByRoute.length) return null;
+    const avgRisk = analyticsByRoute.reduce((sum, r) => sum + r.accidentRiskScore, 0) / analyticsByRoute.length;
+    const avgDensity = analyticsByRoute.reduce((sum, r) => sum + r.trafficDensity, 0) / analyticsByRoute.length;
+    const health = Math.max(1, Math.min(100, Math.round(100 - avgRisk * 0.45 - avgDensity * 3.5)));
+    return {
+      health,
+      avgRisk: Number(avgRisk.toFixed(1)),
+      avgDensity: Number(avgDensity.toFixed(1)),
+    };
+  }, [analyticsByRoute]);
+
+  function applyPreset(type) {
+    if (type === "safe") {
+      setMode("normal");
+      setPreference("least_traffic");
+      setStatus("Preset applied: Safer route preference.");
+      return;
+    }
+    if (type === "fast") {
+      setMode("emergency");
+      setPreference("fastest");
+      setStatus("Preset applied: Fastest response route.");
+      return;
+    }
+    setMode("normal");
+    setPreference("balanced");
+    setStatus("Preset applied: Balanced city commute.");
+  }
+
+  useEffect(() => {
+    fetchGraph();
+    setWeather(generateWeatherReport());
+  }, []);
+
+  function generateWeatherReport() {
+    const hour = new Date().getHours();
+    if (hour >= 7 && hour <= 10) {
+      return {
+        condition: "Haze",
+        temperatureC: 30,
+        visibilityKm: 6,
+        report: "Morning haze: reduced visibility near intersections.",
+        impact: 1.2,
+      };
+    }
+    if (hour >= 16 && hour <= 20) {
+      return {
+        condition: "Light Rain",
+        temperatureC: 27,
+        visibilityKm: 5,
+        report: "Evening drizzle: braking distance slightly increased.",
+        impact: 1.35,
+      };
+    }
+    return {
+      condition: "Clear",
+      temperatureC: 29,
+      visibilityKm: 9,
+      report: "Clear sky with stable road conditions.",
+      impact: 1.05,
+    };
+  }
+
+  async function fetchGraph() {
+    try {
+      const { data } = await axios.get(`${API_BASE}/graph`);
+      setNodes(data.nodes || []);
+      setEdges(data.edges || []);
+      const defaultSource = data.nodes?.[0]?.id || "";
+      const defaultDestination = data.nodes?.[1]?.id || "";
+      setSource(defaultSource);
+      setDestination(defaultDestination);
+      setBlockSource(defaultSource);
+      setBlockTarget(defaultDestination);
+      setRippleSource(defaultSource);
+      setStatus("Graph loaded. Choose your route settings.");
+    } catch {
+      setStatus("Could not connect to backend. Start FastAPI on port 8000.");
+    }
+  }
+
+  async function findRoutes() {
+    if (!source || !destination) return;
+    setLoading(true);
+    setCompareData(null);
+    try {
+      const { data } = await axios.post(`${API_BASE}/route`, {
+        source,
+        destination,
+        mode,
+        preference,
+      });
+      setRoutes(data.routes || []);
+      setStatus(`Found ${data.routes?.length || 0} route options.`);
+    } catch (error) {
+      setRoutes([]);
+      setStatus(error.response?.data?.detail || "No route found.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function compareAlgorithms() {
+    if (!source || !destination) return;
+    setLoading(true);
+    try {
+      const { data } = await axios.post(`${API_BASE}/compare`, {
+        source,
+        destination,
+      });
+      setCompareData(data);
+      setStatus("Dijkstra vs A* comparison ready.");
+    } catch (error) {
+      setCompareData(null);
+      setStatus(error.response?.data?.detail || "Comparison failed.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function applyBlock(action) {
+    if (!blockSource || !blockTarget) return;
+    setLoading(true);
+    try {
+      await axios.post(`${API_BASE}/simulate-block`, {
+        source: blockSource,
+        target: blockTarget,
+        action,
+      });
+      setStatus(`Edge ${blockSource} -> ${blockTarget} set to ${action}.`);
+      await findRoutes();
+    } catch {
+      setStatus("Block simulation failed.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function applyRipple() {
+    if (!rippleSource) return;
+    setLoading(true);
+    try {
+      await axios.post(`${API_BASE}/simulate-ripple`, {
+        source: rippleSource,
+        intensity: Number(rippleIntensity),
+      });
+      setStatus(`Ripple applied at ${rippleSource}.`);
+      await findRoutes();
+    } catch {
+      setStatus("Ripple simulation failed.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="app-shell">
+      <aside className="panel">
+        <h1>Smart Traffic Route Optimization</h1>
+        <p className="status">{status}</p>
+        <section>
+          <h2>Quick Presets</h2>
+          <div className="actions">
+            <button onClick={() => applyPreset("balanced")} disabled={loading}>Balanced</button>
+            <button onClick={() => applyPreset("fast")} disabled={loading}>Fast Response</button>
+          </div>
+          <button onClick={() => applyPreset("safe")} disabled={loading}>Safety First</button>
+        </section>
+
+        {networkHealth && (
+          <section>
+            <h2>Live City Pulse</h2>
+            <div className="kpi-grid">
+              <div className="kpi-card">
+                <span>Network Health</span>
+                <strong>{networkHealth.health}/100</strong>
+              </div>
+              <div className="kpi-card">
+                <span>Avg Risk</span>
+                <strong>{networkHealth.avgRisk}</strong>
+              </div>
+              <div className="kpi-card">
+                <span>Avg Density</span>
+                <strong>{networkHealth.avgDensity}/10</strong>
+              </div>
+              <div className="kpi-card">
+                <span>Weather Impact</span>
+                <strong>{weather.impact}x</strong>
+              </div>
+            </div>
+          </section>
+        )}
+        <section>
+          <h2>Weather Report</h2>
+          <p>{weather.condition} | {weather.temperatureC} C | Visibility {weather.visibilityKm} km</p>
+          <p>{weather.report}</p>
+        </section>
+
+        <section>
+          <h2>Route Finder</h2>
+          <label>Source</label>
+          <select value={source} onChange={(e) => setSource(e.target.value)}>
+            {nodes.map((n) => (
+              <option key={n.id} value={n.id}>
+                {n.name}
+              </option>
+            ))}
+          </select>
+
+          <label>Destination</label>
+          <select value={destination} onChange={(e) => setDestination(e.target.value)}>
+            {nodes.map((n) => (
+              <option key={n.id} value={n.id}>
+                {n.name}
+              </option>
+            ))}
+          </select>
+
+          <label>Mode</label>
+          <select value={mode} onChange={(e) => setMode(e.target.value)}>
+            <option value="normal">Normal</option>
+            <option value="emergency">Emergency</option>
+          </select>
+
+          <label>Preference</label>
+          <select value={preference} onChange={(e) => setPreference(e.target.value)}>
+            <option value="balanced">Balanced</option>
+            <option value="fastest">Fastest</option>
+            <option value="least_traffic">Least Traffic</option>
+          </select>
+          <label>Map Style</label>
+          <select value={mapStyle} onChange={(e) => setMapStyle(e.target.value)}>
+            <option value="standard">Standard</option>
+            <option value="dark">Dark Streets</option>
+            <option value="terrain">Terrain</option>
+          </select>
+
+          <div className="actions">
+            <button onClick={findRoutes} disabled={loading}>
+              Find Route
+            </button>
+            <button onClick={compareAlgorithms} disabled={loading}>
+              Compare Algos
+            </button>
+          </div>
+        </section>
+
+        <section>
+          <h2>Simulation</h2>
+          <label>Block Source</label>
+          <select value={blockSource} onChange={(e) => setBlockSource(e.target.value)}>
+            {nodes.map((n) => (
+              <option key={n.id} value={n.id}>
+                {n.name}
+              </option>
+            ))}
+          </select>
+
+          <label>Block Target</label>
+          <select value={blockTarget} onChange={(e) => setBlockTarget(e.target.value)}>
+            {nodes.map((n) => (
+              <option key={n.id} value={n.id}>
+                {n.name}
+              </option>
+            ))}
+          </select>
+
+          <div className="actions">
+            <button onClick={() => applyBlock("block")} disabled={loading}>
+              Block Edge
+            </button>
+            <button onClick={() => applyBlock("unblock")} disabled={loading}>
+              Unblock Edge
+            </button>
+          </div>
+
+          <label>Ripple Source</label>
+          <select value={rippleSource} onChange={(e) => setRippleSource(e.target.value)}>
+            {nodes.map((n) => (
+              <option key={n.id} value={n.id}>
+                {n.name}
+              </option>
+            ))}
+          </select>
+
+          <label>Ripple Intensity</label>
+          <input
+            type="number"
+            min="1"
+            max="10"
+            step="0.5"
+            value={rippleIntensity}
+            onChange={(e) => setRippleIntensity(e.target.value)}
+          />
+          <button onClick={applyRipple} disabled={loading}>
+            Apply Ripple
+          </button>
+        </section>
+
+        <section>
+          <h2>Top Routes</h2>
+          {routes.length === 0 && <p>No routes yet.</p>}
+          {routes.map((route, idx) => (
+            <div key={`${route.path.join("-")}-${idx}`} className="route-card">
+              <div className="route-head">
+                <strong>Route {routeLetters[idx] || idx + 1}</strong>
+                <span className={idx === 0 ? "tag recommend" : "tag"}>
+                  {idx === 0 ? "AI Recommended" : "Alternative"}
+                </span>
+              </div>
+              <p>{route.path.map((id) => nodeById[id]?.name || id).join(" -> ")}</p>
+              <p>Distance: {analyticsByRoute[idx]?.distance} km | Travel Time: {analyticsByRoute[idx]?.travelTime} min</p>
+              <p>Average Speed: {analyticsByRoute[idx]?.averageSpeed} km/h</p>
+              <p>Traffic Density: {analyticsByRoute[idx]?.trafficDensity}/10</p>
+              <p>Road Quality Index: {analyticsByRoute[idx]?.roadQualityIndex}/10</p>
+              <p>Road Condition: {analyticsByRoute[idx]?.roadCondition}</p>
+              <p>Congestion: {analyticsByRoute[idx]?.congestionBand} | Delay Index: {analyticsByRoute[idx]?.delayIndex}</p>
+              <p>Weather Impact: {analyticsByRoute[idx]?.weatherImpact}x</p>
+              <p>Accident Risk Score: {analyticsByRoute[idx]?.accidentRiskScore}/100</p>
+              <p>Prediction Confidence: {analyticsByRoute[idx]?.confidence}% | Eco Score: {analyticsByRoute[idx]?.ecoScore}/100</p>
+              <p>{route.explanation}</p>
+            </div>
+          ))}
+        </section>
+
+        {routeComparison && (
+          <section>
+            <h2>Route Comparison</h2>
+            <div className="comparison-card risk">
+              <strong>Route A {"->"} Short but risky</strong>
+              <p>{routeComparison.shortRoute.path.map((id) => nodeById[id]?.name || id).join(" -> ")}</p>
+              <p>
+                Distance {routeComparison.shortAnalytics.distance} km | Risk {routeComparison.shortAnalytics.accidentRiskScore}/100
+              </p>
+            </div>
+            <div className="comparison-card safe">
+              <strong>Route B {"->"} Longer but safer</strong>
+              <p>{routeComparison.safeRoute.path.map((id) => nodeById[id]?.name || id).join(" -> ")}</p>
+              <p>
+                Distance {routeComparison.safeAnalytics.distance} km | Risk {routeComparison.safeAnalytics.accidentRiskScore}/100
+              </p>
+            </div>
+          </section>
+        )}
+
+        {smartInsights.length > 0 && (
+          <section>
+            <h2>Smart Insights</h2>
+            {smartInsights.map((item, idx) => (
+              <p key={`${item}-${idx}`} className="insight-item">• {item}</p>
+            ))}
+          </section>
+        )}
+
+        {compareData && (
+          <section>
+            <h2>Algorithm Comparison</h2>
+            <p>Dijkstra: {compareData.dijkstra.execution_ms.toFixed(3)} ms</p>
+            <p>A*: {compareData.astar.execution_ms.toFixed(3)} ms</p>
+          </section>
+        )}
+      </aside>
+
+      <main className="map-wrap">
+        <MapContainer center={mapCenter} zoom={14} className="map">
+          <TileLayer
+            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+            url={
+              mapStyle === "dark"
+                ? "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
+                : mapStyle === "terrain"
+                  ? "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png"
+                  : "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+            }
+          />
+
+          {edges.map((edge, idx) => {
+            const from = nodeById[edge.source];
+            const to = nodeById[edge.target];
+            if (!from || !to) return null;
+            return (
+              <Polyline
+                key={`${edge.source}-${edge.target}-${idx}`}
+                positions={[
+                  [from.lat, from.lng],
+                  [to.lat, to.lng],
+                ]}
+                pathOptions={{ color: "#94a3b8", weight: 2 }}
+              />
+            );
+          })}
+
+          {routes.map((route, idx) => {
+            const positions = route.path
+              .map((id) => nodeById[id])
+              .filter(Boolean)
+              .map((node) => [node.lat, node.lng]);
+            return (
+              <Polyline
+                key={`${route.path.join("-")}-${idx}`}
+                positions={positions}
+                pathOptions={{ color: routeColors[idx] || "#ef4444", weight: 5 }}
+              />
+            );
+          })}
+
+          {nodes.map((node) => (
+            <Marker key={node.id} position={[node.lat, node.lng]}>
+              <Popup>
+                <strong>{node.name}</strong>
+                <br />
+                {node.id}
+              </Popup>
+            </Marker>
+          ))}
+        </MapContainer>
+      </main>
+    </div>
+  );
+}
+
+export default App;
