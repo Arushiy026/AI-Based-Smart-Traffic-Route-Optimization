@@ -1,0 +1,215 @@
+import heapq
+from collections import deque
+import math
+
+class RouteNode:
+    def __init__(self, id, lat, lng):
+        self.id = id
+        self.lat = lat
+        self.lng = lng
+
+class RouteEdge:
+    def __init__(self, source, target, distance, traffic, predicted_traffic=0):
+        self.source = source
+        self.target = target
+        self.distance = distance
+        self.traffic = traffic
+        self.predicted_traffic = predicted_traffic
+        
+    def get_weight(self, alpha=1.0, beta=1.0):
+        # Dynamic Weight Formula: weight = distance + α(traffic) + β(predicted_traffic)
+        return self.distance + alpha * self.traffic + beta * self.predicted_traffic
+
+class GraphEngine:
+    def __init__(self):
+        self.nodes = {}  # id -> RouteNode
+        self.adjacency_list = {}  # node_id -> list of RouteEdge
+
+    def add_node(self, node: RouteNode):
+        self.nodes[node.id] = node
+        if node.id not in self.adjacency_list:
+            self.adjacency_list[node.id] = []
+
+    def add_edge(self, edge: RouteEdge):
+        if edge.source in self.adjacency_list:
+            self.adjacency_list[edge.source].append(edge)
+            
+    def remove_edge(self, source_id, target_id):
+        if source_id in self.adjacency_list:
+            self.adjacency_list[source_id] = [e for e in self.adjacency_list[source_id] if e.target != target_id]
+
+    def bfs_traversal(self, start_id, hops=3):
+        """Standard BFS traversal useful for simulating traffic ripple effect."""
+        if start_id not in self.adjacency_list:
+            return []
+            
+        visited = set([start_id])
+        queue = deque([(start_id, 0)])
+        result_nodes = []
+        
+        while queue:
+            current, current_hops = queue.popleft()
+            result_nodes.append(current)
+            
+            if current_hops < hops:
+                for edge in self.adjacency_list.get(current, []):
+                    if edge.target not in visited:
+                        visited.add(edge.target)
+                        queue.append((edge.target, current_hops + 1))
+                        
+        return result_nodes
+
+    def dijkstra(self, start_id, target_id, alpha=1.0, beta=1.0, ignored_nodes=None, ignored_edges=None):
+        """Find optimized route using Dijkstra's algorithm."""
+        if start_id not in self.adjacency_list or target_id not in self.adjacency_list:
+            return None, float('inf')
+
+        ignored_nodes = ignored_nodes or set()
+        ignored_edges = ignored_edges or set()
+
+        distances = {node: float('inf') for node in self.nodes}
+        distances[start_id] = 0
+        previous = {node: None for node in self.nodes}
+        pq = [(0, start_id)]
+
+        while pq:
+            current_dist, current_node = heapq.heappop(pq)
+
+            if current_node == target_id:
+                break
+
+            if current_dist > distances[current_node]:
+                continue
+
+            if current_node in ignored_nodes and current_node != start_id:
+                continue
+
+            for edge in self.adjacency_list.get(current_node, []):
+                if edge.target in ignored_nodes:
+                    continue
+                if (current_node, edge.target) in ignored_edges:
+                    continue
+
+                weight = edge.get_weight(alpha, beta)
+                new_dist = current_dist + weight
+
+                if new_dist < distances[edge.target]:
+                    distances[edge.target] = new_dist
+                    previous[edge.target] = current_node
+                    heapq.heappush(pq, (new_dist, edge.target))
+
+        # Reconstruct path
+        path = []
+        curr = target_id
+        while curr is not None:
+            path.insert(0, curr)
+            curr = previous[curr]
+
+        if path and path[0] == start_id:
+            return path, distances[target_id]
+        return None, float('inf')
+
+    def yens_k_shortest_paths(self, start_id, target_id, K=3, alpha=1.0, beta=1.0):
+        """Find K shortest paths using Yen's algorithm."""
+        A = []
+        A_costs = []
+        B = []
+
+        # Find the shortest path from start to target
+        initial_path, initial_cost = self.dijkstra(start_id, target_id, alpha, beta)
+        if not initial_path:
+            return [], []
+            
+        A.append(initial_path)
+        A_costs.append(initial_cost)
+
+        for k in range(1, K):
+            for i in range(len(A[k-1]) - 1):
+                spur_node = A[k-1][i]
+                root_path = A[k-1][:i+1]
+
+                ignored_edges = set()
+                ignored_nodes = set()
+
+                for path in A:
+                    if len(path) > i and path[:i+1] == root_path:
+                        ignored_edges.add((path[i], path[i+1]))
+
+                for root_path_node in root_path[:-1]:
+                    ignored_nodes.add(root_path_node)
+
+                spur_path, spur_cost = self.dijkstra(spur_node, target_id, alpha, beta, ignored_nodes, ignored_edges)
+
+                if spur_path:
+                    total_path = root_path[:-1] + spur_path
+                    # calculate total cost based on the full path
+                    total_cost = 0
+                    for j in range(len(total_path)-1):
+                        u, v = total_path[j], total_path[j+1]
+                        edge = next((e for e in self.adjacency_list[u] if e.target == v), None)
+                        if edge:
+                            total_cost += edge.get_weight(alpha, beta)
+                    
+                    if (total_cost, total_path) not in B:
+                        heapq.heappush(B, (total_cost, total_path))
+
+            if not B:
+                break
+
+            cost, path = heapq.heappop(B)
+            A.append(path)
+            A_costs.append(cost)
+
+        return A, A_costs
+
+    def heuristic(self, node_id, target_id):
+        """A simple Euclidian distance heuristic for A*"""
+        n1 = self.nodes.get(node_id)
+        n2 = self.nodes.get(target_id)
+        if not n1 or not n2: return 0
+        # Haversine or simple Euclidean proxy, multiply by constant to match distance scaling
+        dx = n1.lat - n2.lat
+        dy = n1.lng - n2.lng
+        return math.sqrt(dx*dx + dy*dy) * 111 # rough conversion to km
+        
+    def a_star(self, start_id, target_id, alpha=1.0, beta=1.0):
+        """Find optimized route using A* Search algorithm."""
+        if start_id not in self.adjacency_list or target_id not in self.adjacency_list:
+            return None, float('inf')
+
+        open_set = [(0, start_id)]
+        
+        g_scores = {node: float('inf') for node in self.nodes}
+        g_scores[start_id] = 0
+        
+        f_scores = {node: float('inf') for node in self.nodes}
+        f_scores[start_id] = self.heuristic(start_id, target_id)
+        
+        previous = {node: None for node in self.nodes}
+
+        while open_set:
+            current_f, current_node = heapq.heappop(open_set)
+
+            if current_node == target_id:
+                break
+
+            for edge in self.adjacency_list.get(current_node, []):
+                weight = edge.get_weight(alpha, beta)
+                tentative_g_score = g_scores[current_node] + weight
+
+                if tentative_g_score < g_scores[edge.target]:
+                    previous[edge.target] = current_node
+                    g_scores[edge.target] = tentative_g_score
+                    f_scores[edge.target] = tentative_g_score + self.heuristic(edge.target, target_id)
+                    heapq.heappush(open_set, (f_scores[edge.target], edge.target))
+
+        # Reconstruct path
+        path = []
+        curr = target_id
+        while curr is not None:
+            path.insert(0, curr)
+            curr = previous[curr]
+
+        if path and path[0] == start_id:
+            return path, g_scores[target_id]
+        return None, float('inf')
